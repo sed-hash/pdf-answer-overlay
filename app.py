@@ -12,7 +12,7 @@ st.set_page_config(
 )
 
 def get_font_settings():
-    """Returns font parameters compatible with Windows and Linux/Cloud."""
+    """Returns Japanese font parameters compatible with Windows and Linux/Cloud."""
     windows_fonts = [
         r"C:\Windows\Fonts\meiryo.ttc",
         r"C:\Windows\Fonts\msgothic.ttc",
@@ -25,9 +25,9 @@ def get_font_settings():
     return "japan", "builtin"
 
 def process_pdf_bytes(pdf_bytes, text_color_rgb):
-    """Processes in-memory PDF bytes and returns modified PDF bytes with stats."""
+    """Processes in-memory PDF bytes with char-level precision and returns modified PDF bytes with stats."""
     doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
-    font_target, font_type = get_font_settings()
+    jp_font_target, jp_font_type = get_font_settings()
     
     total_pages = len(doc)
     modified_pages = 0
@@ -38,7 +38,7 @@ def process_pdf_bytes(pdf_bytes, text_color_rgb):
         page = doc[pno]
         page_rect = page.rect
         
-        # 1. Collect white fill rects
+        # 1. Collect white fill rects (masks)
         white_rects = []
         for d in page.get_drawings():
             fill = d.get("fill")
@@ -51,57 +51,78 @@ def process_pdf_bytes(pdf_bytes, text_color_rgb):
         if not white_rects:
             continue
 
-        # 2. Extract hidden text spans
+        # 2. Extract hidden characters with char-level accuracy
         try:
-            d_json = json.loads(page.get_text("json"))
+            d_json = json.loads(page.get_text("rawjson"))
         except Exception:
             continue
 
-        spans_to_overlay = []
+        page_has_hidden = False
+        page_answers = []
+
         for b in d_json.get("blocks", []):
             for l in b.get("lines", []):
+                curr_word = ""
                 for s in l.get("spans", []):
-                    text = s.get("text", "").strip()
-                    if not text:
-                        continue
-                    s_rect = pymupdf.Rect(s["bbox"])
-                    s_center = pymupdf.Point((s_rect.x0 + s_rect.x1) / 2.0, (s_rect.y0 + s_rect.y1) / 2.0)
-                    
-                    is_hidden = False
-                    for wr in white_rects:
-                        if s_center in wr or ((s_rect & wr).get_area() > 0.3 * s_rect.get_area()):
-                            is_hidden = True
-                            break
-                    if is_hidden:
-                        spans_to_overlay.append(s)
+                    size = s.get("size", 12.0)
+                    for c in s.get("chars", []):
+                        ch = c.get("c", "")
+                        c_rect = pymupdf.Rect(c["bbox"])
+                        c_center = pymupdf.Point((c_rect.x0 + c_rect.x1) / 2.0, (c_rect.y0 + c_rect.y1) / 2.0)
+                        
+                        is_hidden = False
+                        for wr in white_rects:
+                            if c_center in wr or ((c_rect & wr).get_area() > 0.4 * c_rect.get_area()):
+                                is_hidden = True
+                                break
+                                
+                        if is_hidden:
+                            page_has_hidden = True
+                            curr_word += ch
+                            
+                            # Render character directly at exact character origin
+                            if ch and not ch.isspace():
+                                origin = pymupdf.Point(c["origin"])
+                                if ord(ch) < 128:
+                                    # English / ASCII: use standard Helvetica for exact kerning
+                                    page.insert_text(
+                                        origin,
+                                        ch,
+                                        fontsize=size,
+                                        fontname="helv",
+                                        color=text_color_rgb
+                                    )
+                                else:
+                                    # Japanese / CJK: use Meiryo/YuGoth on Windows, 'japan' on Linux
+                                    if jp_font_type == "file":
+                                        page.insert_text(
+                                            origin,
+                                            ch,
+                                            fontsize=size,
+                                            fontname="jp_font",
+                                            fontfile=jp_font_target,
+                                            color=text_color_rgb
+                                        )
+                                    else:
+                                        page.insert_text(
+                                            origin,
+                                            ch,
+                                            fontsize=size,
+                                            fontname=jp_font_target,
+                                            color=text_color_rgb
+                                        )
+                        else:
+                            if curr_word.strip():
+                                page_answers.append(curr_word.strip())
+                                curr_word = ""
+                if curr_word.strip():
+                    page_answers.append(curr_word.strip())
 
-        # 3. Overlay the hidden text
-        if spans_to_overlay:
+        if page_has_hidden:
             modified_pages += 1
-            total_answers += len(spans_to_overlay)
-            for s in spans_to_overlay:
-                text = s.get("text", "")
-                origin = pymupdf.Point(s["origin"])
-                size = s.get("size", 12.0)
-                summary_answers.append(f"P{pno+1}: {text}")
-                
-                if font_type == "file":
-                    page.insert_text(
-                        origin,
-                        text,
-                        fontsize=size,
-                        fontname="jp_font",
-                        fontfile=font_target,
-                        color=text_color_rgb
-                    )
-                else:
-                    page.insert_text(
-                        origin,
-                        text,
-                        fontsize=size,
-                        fontname=font_target,
-                        color=text_color_rgb
-                    )
+            total_answers += len(page_answers)
+            for ans in page_answers:
+                summary_answers.append(f"P{pno+1}: {ans}")
 
     output_buffer = io.BytesIO()
     doc.save(output_buffer, deflate=True)
