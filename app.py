@@ -37,18 +37,41 @@ def process_pdf_bytes(pdf_bytes, text_color_rgb):
     for pno in range(total_pages):
         page = doc[pno]
         page_rect = page.rect
+        drawings = page.get_drawings()
         
-        # 1. Collect white fill rects (masks)
-        white_rects = []
-        for d in page.get_drawings():
-            fill = d.get("fill")
+        # 1. Collect real answer masks
+        # Distinguish real answer masks from background shapes (tables, speech bubbles, card backgrounds)
+        white_fills = []
+        stroke_rects = []
+        
+        for d in drawings:
             r = d.get("rect")
+            fill = d.get("fill")
+            color = d.get("color")
+            
             if fill is not None and len(fill) >= 3:
-                if fill[0] > 0.9 and fill[1] > 0.9 and fill[2] > 0.9:
+                if fill[0] > 0.95 and fill[1] > 0.95 and fill[2] > 0.95:
                     if r.width < page_rect.width * 0.9 or r.height < page_rect.height * 0.9:
-                        white_rects.append(r)
+                        white_fills.append(r)
                         
-        if not white_rects:
+            if fill is None and color is not None:
+                # Black or dark border stroke
+                if color[0] < 0.2 and color[1] < 0.2 and color[2] < 0.2:
+                    stroke_rects.append(r)
+                    
+        # A real answer box has a white fill AND a matching bounding border stroke (pair)
+        real_masks = []
+        for wf in white_fills:
+            has_border = any(
+                abs(wf.x0 - sr.x0) < 3 and abs(wf.y0 - sr.y0) < 3 and abs(wf.x1 - sr.x1) < 3 and abs(wf.y1 - sr.y1) < 3
+                for sr in stroke_rects
+            )
+            if has_border and (15 <= wf.height <= 65):
+                real_masks.append(wf)
+            elif not stroke_rects and (18 <= wf.height <= 55):
+                real_masks.append(wf)
+                        
+        if not real_masks:
             continue
 
         # 2. Extract hidden characters with char-level accuracy
@@ -71,8 +94,9 @@ def process_pdf_bytes(pdf_bytes, text_color_rgb):
                         c_center = pymupdf.Point((c_rect.x0 + c_rect.x1) / 2.0, (c_rect.y0 + c_rect.y1) / 2.0)
                         
                         is_hidden = False
-                        for wr in white_rects:
-                            if c_center in wr or ((c_rect & wr).get_area() > 0.4 * c_rect.get_area()):
+                        for wr in real_masks:
+                            # Must be strictly centered or >=60% inside mask (avoid line-end margin touches)
+                            if c_center in wr or ((c_rect & wr).get_area() > 0.6 * c_rect.get_area()):
                                 is_hidden = True
                                 break
                                 
